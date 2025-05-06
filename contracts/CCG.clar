@@ -226,3 +226,123 @@
         (is-eq status "rejected")
     )
 )
+
+
+
+(define-map valid-categories 
+    (string-ascii 50)
+    {active: bool}
+)
+
+(define-public (add-category (category (string-ascii 50)))
+    (begin
+        (asserts! (is-authorized tx-sender) ERR-NOT-AUTHORIZED)
+        (map-set valid-categories category {active: true})
+        (ok true)
+    )
+)
+
+(define-public (remove-category (category (string-ascii 50)))
+    (begin
+        (asserts! (is-authorized tx-sender) ERR-NOT-AUTHORIZED)
+        (map-set valid-categories category {active: false})
+        (ok true)
+    )
+)
+
+(define-read-only (is-valid-category (category (string-ascii 50)))
+    (get active (default-to {active: false} (map-get? valid-categories category)))
+)
+
+
+(define-constant PRIORITY-HIGH "high")
+(define-constant PRIORITY-MEDIUM "medium")
+(define-constant PRIORITY-LOW "low")
+
+(define-map complaints-with-priority
+    { id: uint }
+    {
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        status: (string-ascii 20),
+        submitter: principal,
+        resolver: (optional principal),
+        timestamp: uint,
+        resolution-notes: (optional (string-ascii 500)),
+        category: (string-ascii 50),
+        votes: uint,
+        priority: (string-ascii 10)
+    }
+)
+
+(define-public (submit-complaint-with-priority 
+    (title (string-ascii 100)) 
+    (description (string-ascii 500)) 
+    (category (string-ascii 50))
+    (priority (string-ascii 10)))
+    (let
+        (
+            (complaint-id (+ (var-get complaint-counter) u1))
+            (caller tx-sender)
+            (user-complaints (default-to (list) (map-get? citizen-complaints caller)))
+        )
+        (asserts! (> (len title) u0) ERR-EMPTY-TITLE)
+        (asserts! (> (len description) u0) ERR-EMPTY-DESCRIPTION)
+        (asserts! (< (len user-complaints) u50) ERR-TOO-MANY-COMPLAINTS)
+        (asserts! (is-valid-priority priority) (err u110))
+        
+        (map-set complaints-with-priority
+            { id: complaint-id }
+            { 
+                title: title,
+                description: description,
+                status: "pending",
+                submitter: caller,
+                resolver: none,
+                timestamp: stacks-block-height,
+                resolution-notes: none,
+                category: category,
+                votes: u0,
+                priority: priority
+            }
+        )
+        
+        (map-set citizen-complaints
+            caller
+            (unwrap-panic (as-max-len? (append user-complaints complaint-id) u50))
+        )
+        
+        (var-set complaint-counter complaint-id)
+        (ok complaint-id)
+    )
+)
+
+(define-private (is-valid-priority (priority (string-ascii 10)))
+    (or
+        (is-eq priority PRIORITY-HIGH)
+        (is-eq priority PRIORITY-MEDIUM)
+        (is-eq priority PRIORITY-LOW)
+    )
+)
+
+(define-map authorized-resolvers
+    principal
+    { active: bool }
+)
+
+(define-public (add-resolver (resolver principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (map-set authorized-resolvers resolver { active: true })
+        (ok true)
+    )
+)
+
+(define-public (remove-resolver (resolver principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (map-set authorized-resolvers resolver { active: false })
+        (ok true)
+    )
+)
+
