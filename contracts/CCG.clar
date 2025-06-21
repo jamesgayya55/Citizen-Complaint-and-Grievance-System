@@ -346,3 +346,217 @@
     )
 )
 
+(define-constant ERR-ALREADY-ESCALATED (err u109))
+(define-constant ERR-CANNOT-ESCALATE (err u110))
+(define-constant ERR-INVALID-ESCALATION-LEVEL (err u111))
+
+(define-constant ESCALATION-VOTE-THRESHOLD u10)
+(define-constant ESCALATION-TIME-THRESHOLD u144)
+(define-constant ESCALATION-LEVEL-1 "level-1")
+(define-constant ESCALATION-LEVEL-2 "level-2")
+(define-constant ESCALATION-LEVEL-3 "urgent")
+
+(define-map complaint-escalations
+    { complaint-id: uint }
+    {
+        escalation-level: (string-ascii 10),
+        escalated-at: uint,
+        escalated-by: principal,
+        escalation-reason: (string-ascii 20),
+        auto-escalated: bool
+    }
+)
+
+(define-map escalation-history
+    { complaint-id: uint, escalation-id: uint }
+    {
+        from-level: (string-ascii 10),
+        to-level: (string-ascii 10),
+        timestamp: uint,
+        reason: (string-ascii 50)
+    }
+)
+
+(define-map escalation-counters
+    { complaint-id: uint }
+    { counter: uint }
+)
+
+(define-public (escalate-complaint (complaint-id uint) (reason (string-ascii 20)))
+    (let
+        (
+            (complaint (unwrap! (map-get? complaints {id: complaint-id}) ERR-NOT-FOUND))
+            (caller tx-sender)
+            (current-escalation (map-get? complaint-escalations {complaint-id: complaint-id}))
+            (votes (get votes complaint))
+            (complaint-age (- stacks-block-height (get timestamp complaint)))
+        )
+        (asserts! (is-none current-escalation) ERR-ALREADY-ESCALATED)
+        (asserts! (is-eq (get status complaint) "pending") ERR-INVALID-STATUS)
+        (asserts! (or 
+            (>= votes ESCALATION-VOTE-THRESHOLD)
+            (>= complaint-age ESCALATION-TIME-THRESHOLD)
+            (is-authorized caller)
+        ) ERR-CANNOT-ESCALATE)
+        
+        (let
+            (
+                (escalation-level (get-escalation-level votes complaint-age))
+                (is-auto (not (is-authorized caller)))
+            )
+            (map-set complaint-escalations
+                { complaint-id: complaint-id }
+                {
+                    escalation-level: escalation-level,
+                    escalated-at: stacks-block-height,
+                    escalated-by: caller,
+                    escalation-reason: reason,
+                    auto-escalated: is-auto
+                }
+            )
+            
+            ;; (try! (record-escalation-history complaint-id "none" escalation-level reason))
+            (ok escalation-level)
+        )
+    )
+)
+
+(define-public (update-escalation-level (complaint-id uint) (new-level (string-ascii 10)))
+    (let
+        (
+            (complaint (unwrap! (map-get? complaints {id: complaint-id}) ERR-NOT-FOUND))
+            (escalation (unwrap! (map-get? complaint-escalations {complaint-id: complaint-id}) ERR-NOT-FOUND))
+            (caller tx-sender)
+        )
+        (asserts! (is-authorized caller) ERR-NOT-AUTHORIZED)
+        (asserts! (is-valid-escalation-level new-level) ERR-INVALID-ESCALATION-LEVEL)
+        
+        (let
+            (
+                (old-level (get escalation-level escalation))
+            )
+            (map-set complaint-escalations
+                { complaint-id: complaint-id }
+                (merge escalation {
+                    escalation-level: new-level,
+                    escalated-at: stacks-block-height,
+                    escalated-by: caller,
+                    auto-escalated: false
+                })
+            )
+            
+            ;; (try! (record-escalation-history complaint-id old-level new-level "manual-update"))
+            (ok true)
+        )
+    )
+)
+
+(define-public (check-and-auto-escalate (complaint-id uint))
+    (let
+        (
+            (complaint (unwrap! (map-get? complaints {id: complaint-id}) ERR-NOT-FOUND))
+            (current-escalation (map-get? complaint-escalations {complaint-id: complaint-id}))
+            (votes (get votes complaint))
+            (complaint-age (- stacks-block-height (get timestamp complaint)))
+        )
+        (asserts! (is-eq (get status complaint) "pending") ERR-INVALID-STATUS)
+        
+        (if (is-none current-escalation)
+            (if (or 
+                (>= votes ESCALATION-VOTE-THRESHOLD)
+                (>= complaint-age ESCALATION-TIME-THRESHOLD)
+            )
+                (let
+                    (
+                        (escalation-level (get-escalation-level votes complaint-age))
+                    )
+                    (map-set complaint-escalations
+                        { complaint-id: complaint-id }
+                        {
+                            escalation-level: escalation-level,
+                            escalated-at: stacks-block-height,
+                            escalated-by: tx-sender,
+                            escalation-reason: "auto-escalation",
+                            auto-escalated: true
+                        }
+                    )
+                    
+                    ;; (try! (record-escalation-history complaint-id "none" escalation-level "auto-escalation"))
+                    (ok true)
+                )
+                (ok false)
+            )
+            (ok false)
+        )
+    )
+)
+
+(define-read-only (get-complaint-escalation (complaint-id uint))
+    (ok (map-get? complaint-escalations {complaint-id: complaint-id}))
+)
+
+(define-read-only (get-escalation-history (complaint-id uint) (escalation-id uint))
+    (ok (map-get? escalation-history {complaint-id: complaint-id, escalation-id: escalation-id}))
+)
+
+(define-read-only (get-escalation-count (complaint-id uint))
+    (ok (get counter (default-to {counter: u0} (map-get? escalation-counters {complaint-id: complaint-id}))))
+)
+
+(define-read-only (is-escalated (complaint-id uint))
+    (ok (is-some (map-get? complaint-escalations {complaint-id: complaint-id})))
+)
+
+(define-read-only (get-escalation-thresholds)
+    (ok {
+        vote-threshold: ESCALATION-VOTE-THRESHOLD,
+        time-threshold: ESCALATION-TIME-THRESHOLD
+    })
+)
+
+(define-private (get-escalation-level (votes uint) (age uint))
+    (if (>= votes (* ESCALATION-VOTE-THRESHOLD u3))
+        ESCALATION-LEVEL-3
+        (if (>= age (* ESCALATION-TIME-THRESHOLD u2))
+            ESCALATION-LEVEL-3
+            (if (>= votes (* ESCALATION-VOTE-THRESHOLD u2))
+                ESCALATION-LEVEL-2
+                ESCALATION-LEVEL-1
+            )
+        )
+    )
+)
+
+(define-private (is-valid-escalation-level (level (string-ascii 10)))
+    (or
+        (is-eq level ESCALATION-LEVEL-1)
+        (is-eq level ESCALATION-LEVEL-2)
+        (is-eq level ESCALATION-LEVEL-3)
+    )
+)
+
+(define-private (record-escalation-history (complaint-id uint) (from-level (string-ascii 10)) (to-level (string-ascii 10)) (reason (string-ascii 50)))
+    (let
+        (
+            (counter-key {complaint-id: complaint-id})
+            (current-counter (default-to {counter: u0} (map-get? escalation-counters counter-key)))
+            (new-escalation-id (+ (get counter current-counter) u1))
+        )
+        (map-set escalation-history
+            {complaint-id: complaint-id, escalation-id: new-escalation-id}
+            {
+                from-level: from-level,
+                to-level: to-level,
+                timestamp: stacks-block-height,
+                reason: reason
+            }
+        )
+        
+        (map-set escalation-counters
+            counter-key
+            {counter: new-escalation-id}
+        )
+        
+        (ok new-escalation-id)
+    )
+)
