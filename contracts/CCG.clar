@@ -358,6 +358,11 @@
 (define-constant ERR-INVALID-RATING (err u113))
 (define-constant ERR-COMPLAINT-NOT-RESOLVED (err u114))
 (define-constant ERR-NOT-COMPLAINT-SUBMITTER (err u115))
+(define-constant ERR-DEPARTMENT-NOT-FOUND (err u116))
+(define-constant ERR-ALREADY-ASSIGNED (err u117))
+(define-constant ERR-NOT-ASSIGNED (err u118))
+(define-constant ERR-INVALID-DEPARTMENT (err u119))
+(define-constant ERR-DEPARTMENT-INACTIVE (err u120))
 
 (define-constant ESCALATION-VOTE-THRESHOLD u10)
 (define-constant ESCALATION-TIME-THRESHOLD u144)
@@ -749,6 +754,431 @@
             (is-none (map-get? complaint-ratings { complaint-id: complaint-id }))
         ))
         (ok false)
+    )
+)
+
+;; =================
+;; ASSIGNMENT SYSTEM
+;; =================
+
+;; Department registry for organizational structure
+(define-map departments
+    (string-ascii 50)
+    {
+        name: (string-ascii 100),
+        head: principal,
+        active: bool,
+        created-at: uint,
+    }
+)
+
+;; Complaint assignments to departments and individuals
+(define-map complaint-assignments
+    { complaint-id: uint }
+    {
+        assigned-to: principal,
+        department: (string-ascii 50),
+        assigned-by: principal,
+        assigned-at: uint,
+        notes: (optional (string-ascii 300)),
+        status: (string-ascii 20), ;; "assigned", "accepted", "working", "completed"
+    }
+)
+
+;; Assignment history for tracking changes
+(define-map assignment-history
+    {
+        complaint-id: uint,
+        assignment-id: uint,
+    }
+    {
+        previous-assignee: (optional principal),
+        new-assignee: principal,
+        department: (string-ascii 50),
+        changed-by: principal,
+        changed-at: uint,
+        reason: (string-ascii 200),
+    }
+)
+
+;; Assignment counters for history tracking
+(define-map assignment-counters
+    { complaint-id: uint }
+    { counter: uint }
+)
+
+;; Department workload tracking
+(define-map department-workload
+    (string-ascii 50)
+    {
+        total-assigned: uint,
+        active-complaints: uint,
+        completed-complaints: uint,
+        avg-resolution-time: uint,
+    }
+)
+
+;; Individual assignee workload tracking
+(define-map assignee-workload
+    principal
+    {
+        total-assigned: uint,
+        active-complaints: uint,
+        completed-complaints: uint,
+        current-department: (optional (string-ascii 50)),
+    }
+)
+
+;; Register a new department
+(define-public (register-department
+        (dept-code (string-ascii 50))
+        (name (string-ascii 100))
+        (head principal)
+    )
+    (begin
+        (asserts! (is-authorized tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (> (len dept-code) u0) ERR-INVALID-DEPARTMENT)
+        (asserts! (> (len name) u0) ERR-INVALID-DEPARTMENT)
+
+        (map-set departments dept-code {
+            name: name,
+            head: head,
+            active: true,
+            created-at: stacks-block-height,
+        })
+
+        ;; Initialize workload tracking
+        (map-set department-workload dept-code {
+            total-assigned: u0,
+            active-complaints: u0,
+            completed-complaints: u0,
+            avg-resolution-time: u0,
+        })
+
+        (ok true)
+    )
+)
+
+;; Assign complaint to department and individual
+(define-public (assign-complaint
+        (complaint-id uint)
+        (assignee principal)
+        (department (string-ascii 50))
+        (notes (optional (string-ascii 300)))
+    )
+    (let (
+            (complaint (unwrap! (map-get? complaints { id: complaint-id }) ERR-NOT-FOUND))
+            (dept-info (unwrap! (map-get? departments department) ERR-DEPARTMENT-NOT-FOUND))
+            (existing-assignment (map-get? complaint-assignments { complaint-id: complaint-id }))
+            (caller tx-sender)
+        )
+        ;; Validation checks
+        (asserts! (is-authorized caller) ERR-NOT-AUTHORIZED)
+        (asserts! (get active dept-info) ERR-DEPARTMENT-INACTIVE)
+        (asserts! (is-none existing-assignment) ERR-ALREADY-ASSIGNED)
+        (asserts! (not (is-eq (get status complaint) "resolved"))
+            ERR-ALREADY-RESOLVED
+        )
+
+        ;; Create assignment
+        (map-set complaint-assignments { complaint-id: complaint-id } {
+            assigned-to: assignee,
+            department: department,
+            assigned-by: caller,
+            assigned-at: stacks-block-height,
+            notes: notes,
+            status: "assigned",
+        })
+
+        ;; Update workload counters
+        (let (
+                (dept-workload-data (default-to {
+                    total-assigned: u0,
+                    active-complaints: u0,
+                    completed-complaints: u0,
+                    avg-resolution-time: u0,
+                }
+                    (map-get? department-workload department)
+                ))
+                (assignee-workload-data (default-to {
+                    total-assigned: u0,
+                    active-complaints: u0,
+                    completed-complaints: u0,
+                    current-department: none,
+                }
+                    (map-get? assignee-workload assignee)
+                ))
+            )
+            ;; Update department workload
+            (map-set department-workload department
+                (merge dept-workload-data {
+                    total-assigned: (+ (get total-assigned dept-workload-data) u1),
+                    active-complaints: (+ (get active-complaints dept-workload-data) u1),
+                })
+            )
+
+            ;; Update assignee workload  
+            (map-set assignee-workload assignee
+                (merge assignee-workload-data {
+                    total-assigned: (+ (get total-assigned assignee-workload-data) u1),
+                    active-complaints: (+ (get active-complaints assignee-workload-data) u1),
+                    current-department: (some department),
+                })
+            )
+        )
+
+        ;; Record in assignment history
+        (unwrap-panic (record-assignment-change complaint-id none assignee department
+            "initial-assignment"
+        ))
+
+        (ok true)
+    )
+)
+
+;; Reassign complaint to different assignee/department
+(define-public (reassign-complaint
+        (complaint-id uint)
+        (new-assignee principal)
+        (new-department (string-ascii 50))
+        (reason (string-ascii 200))
+    )
+    (let (
+            (complaint (unwrap! (map-get? complaints { id: complaint-id }) ERR-NOT-FOUND))
+            (assignment (unwrap!
+                (map-get? complaint-assignments { complaint-id: complaint-id })
+                ERR-NOT-ASSIGNED
+            ))
+            (dept-info (unwrap! (map-get? departments new-department)
+                ERR-DEPARTMENT-NOT-FOUND
+            ))
+            (caller tx-sender)
+        )
+        ;; Validation
+        (asserts! (is-authorized caller) ERR-NOT-AUTHORIZED)
+        (asserts! (get active dept-info) ERR-DEPARTMENT-INACTIVE)
+        (asserts! (not (is-eq (get status complaint) "resolved"))
+            ERR-ALREADY-RESOLVED
+        )
+
+        (let (
+                (old-assignee (get assigned-to assignment))
+                (old-department (get department assignment))
+            )
+            ;; Update assignment
+            (map-set complaint-assignments { complaint-id: complaint-id }
+                (merge assignment {
+                    assigned-to: new-assignee,
+                    department: new-department,
+                    assigned-by: caller,
+                    assigned-at: stacks-block-height,
+                    status: "assigned",
+                })
+            )
+
+            ;; Update old department workload (decrease)
+            (let ((old-dept-workload (default-to {
+                    total-assigned: u0,
+                    active-complaints: u0,
+                    completed-complaints: u0,
+                    avg-resolution-time: u0,
+                }
+                    (map-get? department-workload old-department)
+                )))
+                (map-set department-workload old-department
+                    (merge old-dept-workload { active-complaints: (if (> (get active-complaints old-dept-workload) u0)
+                        (- (get active-complaints old-dept-workload) u1)
+                        u0
+                    ) }
+                    ))
+            )
+
+            ;; Update new department workload (increase)
+            (let ((new-dept-workload (default-to {
+                    total-assigned: u0,
+                    active-complaints: u0,
+                    completed-complaints: u0,
+                    avg-resolution-time: u0,
+                }
+                    (map-get? department-workload new-department)
+                )))
+                (map-set department-workload new-department
+                    (merge new-dept-workload {
+                        total-assigned: (+ (get total-assigned new-dept-workload) u1),
+                        active-complaints: (+ (get active-complaints new-dept-workload) u1),
+                    })
+                )
+            )
+
+            ;; Update assignee workloads
+            (let (
+                    (old-assignee-workload-data (default-to {
+                        total-assigned: u0,
+                        active-complaints: u0,
+                        completed-complaints: u0,
+                        current-department: none,
+                    }
+                        (map-get? assignee-workload old-assignee)
+                    ))
+                    (new-assignee-workload-data (default-to {
+                        total-assigned: u0,
+                        active-complaints: u0,
+                        completed-complaints: u0,
+                        current-department: none,
+                    }
+                        (map-get? assignee-workload new-assignee)
+                    ))
+                )
+                ;; Decrease old assignee workload
+                (map-set assignee-workload old-assignee
+                    (merge old-assignee-workload-data { active-complaints: (if (> (get active-complaints old-assignee-workload-data) u0)
+                        (- (get active-complaints old-assignee-workload-data) u1)
+                        u0
+                    ) }
+                    ))
+
+                ;; Increase new assignee workload
+                (map-set assignee-workload new-assignee
+                    (merge new-assignee-workload-data {
+                        total-assigned: (+ (get total-assigned new-assignee-workload-data) u1),
+                        active-complaints: (+ (get active-complaints new-assignee-workload-data) u1),
+                        current-department: (some new-department),
+                    })
+                )
+            )
+
+            ;; Record reassignment in history
+            (unwrap-panic (record-assignment-change complaint-id (some old-assignee)
+                new-assignee new-department reason
+            ))
+
+            (ok true)
+        )
+    )
+)
+
+;; Update assignment status (for assignees to update their progress)
+(define-public (update-assignment-status
+        (complaint-id uint)
+        (new-status (string-ascii 20))
+    )
+    (let (
+            (assignment (unwrap!
+                (map-get? complaint-assignments { complaint-id: complaint-id })
+                ERR-NOT-ASSIGNED
+            ))
+            (caller tx-sender)
+        )
+        ;; Allow assignee or authorized personnel to update status
+        (asserts!
+            (or
+                (is-eq (get assigned-to assignment) caller)
+                (is-authorized caller)
+            )
+            ERR-NOT-AUTHORIZED
+        )
+
+        (asserts! (is-valid-assignment-status new-status) ERR-INVALID-STATUS)
+
+        (map-set complaint-assignments { complaint-id: complaint-id }
+            (merge assignment { status: new-status })
+        )
+
+        (ok true)
+    )
+)
+
+;; Deactivate a department
+(define-public (deactivate-department (dept-code (string-ascii 50)))
+    (let ((dept-info (unwrap! (map-get? departments dept-code) ERR-DEPARTMENT-NOT-FOUND)))
+        (asserts! (is-authorized tx-sender) ERR-NOT-AUTHORIZED)
+
+        (map-set departments dept-code (merge dept-info { active: false }))
+        (ok true)
+    )
+)
+
+;; Read-only functions for querying assignments
+
+(define-read-only (get-complaint-assignment (complaint-id uint))
+    (ok (map-get? complaint-assignments { complaint-id: complaint-id }))
+)
+
+(define-read-only (get-department-info (dept-code (string-ascii 50)))
+    (ok (map-get? departments dept-code))
+)
+
+(define-read-only (get-department-workload (dept-code (string-ascii 50)))
+    (ok (map-get? department-workload dept-code))
+)
+
+(define-read-only (get-assignee-workload (assignee principal))
+    (ok (map-get? assignee-workload assignee))
+)
+
+(define-read-only (get-assignment-history
+        (complaint-id uint)
+        (assignment-id uint)
+    )
+    (ok (map-get? assignment-history {
+        complaint-id: complaint-id,
+        assignment-id: assignment-id,
+    }))
+)
+
+(define-read-only (get-assignment-count (complaint-id uint))
+    (ok (get counter
+        (default-to { counter: u0 }
+            (map-get? assignment-counters { complaint-id: complaint-id })
+        )))
+)
+
+(define-read-only (is-complaint-assigned (complaint-id uint))
+    (ok (is-some (map-get? complaint-assignments { complaint-id: complaint-id })))
+)
+
+;; Private helper functions
+
+(define-private (is-valid-assignment-status (status (string-ascii 20)))
+    (or
+        (is-eq status "assigned")
+        (is-eq status "accepted")
+        (is-eq status "working")
+        (is-eq status "completed")
+    )
+)
+
+(define-private (record-assignment-change
+        (complaint-id uint)
+        (previous-assignee (optional principal))
+        (new-assignee principal)
+        (department (string-ascii 50))
+        (reason (string-ascii 200))
+    )
+    (let (
+            (counter-key { complaint-id: complaint-id })
+            (current-counter (default-to { counter: u0 }
+                (map-get? assignment-counters counter-key)
+            ))
+            (new-assignment-id (+ (get counter current-counter) u1))
+        )
+        ;; Record the change
+        (map-set assignment-history {
+            complaint-id: complaint-id,
+            assignment-id: new-assignment-id,
+        } {
+            previous-assignee: previous-assignee,
+            new-assignee: new-assignee,
+            department: department,
+            changed-by: tx-sender,
+            changed-at: stacks-block-height,
+            reason: reason,
+        })
+
+        ;; Update counter
+        (map-set assignment-counters counter-key { counter: new-assignment-id })
+
+        (ok new-assignment-id)
     )
 )
 
